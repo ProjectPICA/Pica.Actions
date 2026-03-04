@@ -1,0 +1,49 @@
+name: Update README Badge
+
+# Reusable workflow to update a shields.io version badge in README.md.
+# Commits with [skip ci] to prevent re-triggering pipelines.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+        description: 'Version string to display in the badge (e.g., 0.3.0-beta.shaa505ab2)'
+      badge_label:
+        required: true
+        type: string
+        description: 'Badge label to match and update (e.g., TST or Prod)'
+      badge_color:
+        required: true
+        type: string
+        description: 'Badge color (e.g., blue, green)'
+
+jobs:
+  update-badge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update ${{ inputs.badge_label }} version badge in README
+        run: |
+          VERSION="${{ inputs.version }}"
+          LABEL="${{ inputs.badge_label }}"
+          COLOR="${{ inputs.badge_color }}"
+          # shields.io encodes hyphens as --
+          BADGE_VERSION=$(echo "$VERSION" | sed 's/-/--/g')
+          sed -i "s|!\[${LABEL}\](https://img.shields.io/badge/${LABEL}-[^)]*)|![${LABEL}](https://img.shields.io/badge/${LABEL}-${BADGE_VERSION}-${COLOR}?style=flat)|" README.md
+          echo "Updated ${LABEL} badge to: $VERSION"
+
+      - name: Commit and push
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add README.md
+          git diff --staged --quiet && echo "No badge change" && exit 0
+          git commit -m "chore: update ${{ inputs.badge_label }} badge to ${{ inputs.version }} [skip ci]"
+          git push
