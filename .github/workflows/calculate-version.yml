@@ -1,0 +1,228 @@
+name: Calculate Version
+
+# Shared reusable workflow for deterministic version calculation.
+# Used by both PICA and PICA.WebApp repositories.
+#
+# Branch-aware versioning:
+#
+# On release/* branches:
+#   - Major.Minor parsed from branch name (release/0.1 → 0.1)
+#   - Patch = count of existing release/X.Y.* tags
+#   - Output: clean semver (e.g., 0.1.0, 0.1.1)
+#
+# On main:
+#   - Find highest version/X.Y tag reachable from commit
+#   - Find highest release/X.Y branch
+#   - Take whichever is greater; if from release branch, bump minor: X.(Y+1)
+#   - Patch always 0, output with stage suffix
+
+on:
+  workflow_call:
+    inputs:
+      commit_sha:
+        required: true
+        type: string
+        description: 'The commit SHA to calculate version for'
+      stage:
+        required: true
+        type: string
+        description: 'Stage: alpha, beta, or release'
+      branch:
+        required: false
+        type: string
+        default: 'main'
+        description: 'Branch name (e.g., main, release/0.1). Used to determine version calculation mode.'
+      sha_prefix:
+        required: false
+        type: string
+        default: ''
+        description: 'Prefix before short SHA in version suffix (e.g., "sha" → 1.0.0-beta.sha1234567, "" → 1.0.0-beta.1234567)'
+    outputs:
+      version:
+        description: "Full version string with stage suffix (e.g., 1.0.2-alpha.sha1234567)"
+        value: ${{ jobs.calculate.outputs.version }}
+      major_minor:
+        description: "Major.minor portion (e.g., 1.0)"
+        value: ${{ jobs.calculate.outputs.major_minor }}
+      patch:
+        description: "Patch number (e.g., 2)"
+        value: ${{ jobs.calculate.outputs.patch }}
+      full_version:
+        description: "Full semantic version without suffix (e.g., 1.0.2)"
+        value: ${{ jobs.calculate.outputs.full_version }}
+      short_sha:
+        description: "Short commit SHA (7 chars)"
+        value: ${{ jobs.calculate.outputs.short_sha }}
+
+jobs:
+  calculate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+      major_minor: ${{ steps.calc.outputs.major_minor }}
+      patch: ${{ steps.calc.outputs.patch }}
+      full_version: ${{ steps.calc.outputs.full_version }}
+      short_sha: ${{ steps.calc.outputs.short_sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Fetch all tags and branches
+        run: |
+          git fetch --tags --force
+          git fetch origin '+refs/heads/release/*:refs/remotes/origin/release/*' 2>/dev/null || true
+          echo "Available version tags:"
+          git tag -l "version/*" || echo "No version tags found"
+          echo ""
+          echo "Available release tags:"
+          git tag -l "release/*" || echo "No release tags found"
+          echo ""
+          echo "Available release branches:"
+          git branch -r --list 'origin/release/*' 2>/dev/null || echo "No release branches found"
+
+      - name: Calculate version from tags
+        id: calc
+        run: |
+          set -e
+
+          COMMIT_SHA="${{ inputs.commit_sha }}"
+          STAGE="${{ inputs.stage }}"
+          BRANCH="${{ inputs.branch }}"
+          SHA_PREFIX="${{ inputs.sha_prefix }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔢 Version Calculation"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Commit SHA: $COMMIT_SHA"
+          echo "Short SHA: $SHORT_SHA"
+          echo "Stage: $STAGE"
+          echo "Branch: $BRANCH"
+          echo "SHA Prefix: '${SHA_PREFIX}'"
+          echo ""
+
+          if [[ "$BRANCH" == release/* ]]; then
+            echo "📦 Release branch mode"
+
+            # Parse X.Y from branch name (release/X.Y → X.Y)
+            MAJOR_MINOR="${BRANCH#release/}"
+            echo "Major.Minor from branch: $MAJOR_MINOR"
+
+            # Patch = count of existing release/X.Y.* tags
+            PATCH=$(git tag -l "release/${MAJOR_MINOR}.*" 2>/dev/null | wc -l | tr -d ' ')
+            echo "Existing release/${MAJOR_MINOR}.* tags: $PATCH"
+
+            # Release version is always clean semver
+            FULL_VERSION="${MAJOR_MINOR}.${PATCH}"
+            VERSION="${FULL_VERSION}"
+
+          else
+            echo "📦 Main branch mode"
+
+            # Step 1: Find highest version/X.Y tag reachable from this commit
+            VERSION_TAG=$(git tag -l "version/*" --sort=-v:refname --merged "$COMMIT_SHA" 2>/dev/null | head -n1)
+
+            if [ -z "$VERSION_TAG" ]; then
+              echo "⚠️  No version tag found, defaulting to 0.1"
+              TAG_MAJOR=0
+              TAG_MINOR=1
+            else
+              echo "✅ Found version tag: $VERSION_TAG"
+              TAG_MAJOR_MINOR="${VERSION_TAG#version/}"
+              TAG_MAJOR="${TAG_MAJOR_MINOR%%.*}"
+              TAG_MINOR="${TAG_MAJOR_MINOR#*.}"
+            fi
+            echo "From version tag: ${TAG_MAJOR}.${TAG_MINOR}"
+
+            # Step 2: Find highest release/X.Y branch
+            HIGHEST_RELEASE=$(git branch -r --list 'origin/release/*' --sort=-v:refname 2>/dev/null | head -n1 | tr -d ' ')
+
+            if [ -n "$HIGHEST_RELEASE" ]; then
+              REL_BRANCH="${HIGHEST_RELEASE#origin/}"
+              REL_MAJOR_MINOR="${REL_BRANCH#release/}"
+              REL_MAJOR="${REL_MAJOR_MINOR%%.*}"
+              REL_MINOR="${REL_MAJOR_MINOR#*.}"
+
+              # Auto-bump: release/X.Y exists → main becomes X.(Y+1)
+              BUMPED_MAJOR="$REL_MAJOR"
+              BUMPED_MINOR=$((REL_MINOR + 1))
+
+              echo "Highest release branch: $REL_BRANCH → bumped to ${BUMPED_MAJOR}.${BUMPED_MINOR}"
+
+              # Step 3: Take the higher of (version tag) vs (release branch + 1 minor)
+              if [ "$BUMPED_MAJOR" -gt "$TAG_MAJOR" ] || \
+                 ([ "$BUMPED_MAJOR" -eq "$TAG_MAJOR" ] && [ "$BUMPED_MINOR" -gt "$TAG_MINOR" ]); then
+                MAJOR_MINOR="${BUMPED_MAJOR}.${BUMPED_MINOR}"
+                echo "Using bumped release version: $MAJOR_MINOR"
+              else
+                MAJOR_MINOR="${TAG_MAJOR}.${TAG_MINOR}"
+                echo "Using version tag: $MAJOR_MINOR"
+              fi
+            else
+              echo "No release branches found"
+              MAJOR_MINOR="${TAG_MAJOR}.${TAG_MINOR}"
+            fi
+
+            # Patch is always 0 on main
+            PATCH=0
+            FULL_VERSION="${MAJOR_MINOR}.${PATCH}"
+
+            # Apply stage suffix
+            case "$STAGE" in
+              alpha)
+                VERSION="${FULL_VERSION}-alpha.${SHA_PREFIX}${SHORT_SHA}"
+                ;;
+              beta)
+                VERSION="${FULL_VERSION}-beta.${SHA_PREFIX}${SHORT_SHA}"
+                ;;
+              release)
+                VERSION="${FULL_VERSION}"
+                ;;
+              *)
+                echo "❌ Error: Invalid stage '$STAGE'. Must be alpha, beta, or release."
+                exit 1
+                ;;
+            esac
+          fi
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 Calculated Version: $VERSION"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Set outputs
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "major_minor=${MAJOR_MINOR}" >> $GITHUB_OUTPUT
+          echo "patch=${PATCH}" >> $GITHUB_OUTPUT
+          echo "full_version=${FULL_VERSION}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Version Summary
+        run: |
+          echo "## 🔢 Version Calculation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA | \`${{ inputs.commit_sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Short SHA | \`${{ steps.calc.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | \`${{ inputs.stage }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`${{ inputs.branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA Prefix | \`${{ inputs.sha_prefix }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Major.Minor | \`${{ steps.calc.outputs.major_minor }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Patch | \`${{ steps.calc.outputs.patch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Full Version | \`${{ steps.calc.outputs.full_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Final Version** | **\`${{ steps.calc.outputs.version }}\`** |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Algorithm" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ inputs.branch }}" == release/* ]]; then
+            echo "1. Release branch mode: parsed \`${{ steps.calc.outputs.major_minor }}\` from branch name" >> $GITHUB_STEP_SUMMARY
+            echo "2. Counted \`${{ steps.calc.outputs.patch }}\` existing release tags" >> $GITHUB_STEP_SUMMARY
+            echo "3. Output clean semver (no stage suffix)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "1. Found version tag or release branch for \`${{ steps.calc.outputs.major_minor }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "2. Patch fixed at \`0\` on main" >> $GITHUB_STEP_SUMMARY
+            echo "3. Applied \`${{ inputs.stage }}\` stage formatting" >> $GITHUB_STEP_SUMMARY
+          fi
